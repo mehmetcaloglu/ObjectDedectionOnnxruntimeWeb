@@ -1,0 +1,509 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { InferenceSession, Tensor } from 'onnxruntime-web';
+import { runModelUtils } from '../../utils';
+
+interface WebcamModelUIProps
+{
+    modelFilepath: string;
+    warmupModel: ( session: InferenceSession ) => Promise<void>;
+    preprocess: ( ctx: CanvasRenderingContext2D ) => Tensor;
+    postprocess: ( t: Tensor, inferenceTime: number ) => void;
+}
+
+const WebcamModelUI: React.FC<WebcamModelUIProps> = ( {
+    modelFilepath,
+    warmupModel,
+    preprocess,
+    postprocess,
+} ) =>
+{
+    const webcamElement = useRef<HTMLVideoElement>( null );
+    const webcamContainer = useRef<HTMLDivElement>( null );
+    const [ videoOrigWidth, setVideoOrigWidth ] = useState( 0 );
+    const [ videoOrigHeight, setVideoOrigHeight ] = useState( 0 );
+    const [ inferenceTime, setInferenceTime ] = useState( 0 );
+    const [ session, setSession ] = useState<InferenceSession | null>( null );
+    const [ gpuSession, setGpuSession ] = useState<InferenceSession | undefined>( undefined );
+    const [ cpuSession, setCpuSession ] = useState<InferenceSession | undefined>( undefined );
+    const [ modelLoading, setModelLoading ] = useState( true );
+    const [ modelInitializing, setModelInitializing ] = useState( true );
+    const [ sessionRunning, setSessionRunning ] = useState( false );
+    const [ modelLoadingError, setModelLoadingError ] = useState( false );
+    const [ webcamEnabled, setWebcamEnabled ] = useState<boolean | undefined>();
+    const [ webcamInitialized, setWebcamInitialized ] = useState( false );
+    const [ webcamStream, setWebcamStream ] = useState<MediaStream | null>( null );
+    const [ sessionBackend, setSessionBackend ] = useState( 'wasm' ); // Default to 'wasm'
+    const [ modelFile, setModelFile ] = useState<ArrayBuffer | null>( null ); // Track model file buffer
+
+    const backendSelectList = [
+        { text: 'GPU-WebGL', value: 'webgl' },
+        { text: 'CPU-WebAssembly', value: 'wasm' },
+    ];
+
+    // Initialize the session based on selected backend
+    const initSession = useCallback( async ( modelFileBuffer: ArrayBuffer ) =>
+    {
+        console.log( 'Initializing session...' );
+        setSessionRunning( false );
+        setModelLoadingError( false );
+        setModelLoading( true );
+        setModelInitializing( true );
+        let gpuSessionInstance: InferenceSession | undefined;
+        let cpuSessionInstance: InferenceSession | undefined;
+        try {
+            if ( sessionBackend === 'webgl' ) {
+                gpuSessionInstance = await runModelUtils.createModelGpu( modelFileBuffer );
+                setGpuSession( gpuSessionInstance );
+                setSession( gpuSessionInstance );
+            } else if ( sessionBackend === 'wasm' ) {
+                cpuSessionInstance = await runModelUtils.createModelCpu( modelFileBuffer );
+                setCpuSession( cpuSessionInstance );
+                setSession( cpuSessionInstance );
+            }
+            await warmupModel( cpuSessionInstance || gpuSessionInstance! );
+        } catch ( e ) {
+            console.error( 'Error initializing session:', e );
+            setModelLoadingError( true );
+        }
+        setModelLoading( false );
+        setModelInitializing( false );
+    }, [ sessionBackend, warmupModel ] );
+
+    // Fetch the model file and initialize the session on mount
+    useEffect( () =>
+    {
+        const fetchModelFile = async () =>
+        {
+            try {
+                const response = await fetch( modelFilepath );
+                const modelFileBuffer = await response.arrayBuffer();
+                setModelFile( modelFileBuffer );
+                await initSession( modelFileBuffer );
+            } catch ( error ) {
+                console.error( 'Error fetching or initializing model:', error );
+                setModelLoadingError( true );
+            }
+        };
+
+        fetchModelFile();
+    }, [ modelFilepath, initSession ] );
+
+    // Handle starting and stopping the camera
+    const webcamController = () =>
+    {
+        console.log( 'Webcam controller clicked' );
+        if ( webcamEnabled ) {
+            stopCamera();
+        } else {
+            runLiveVideo();
+        }
+    };
+
+    // Setup webcam and start streaming
+    const setupWebcam = async () =>
+    {
+        console.log( 'Setting up webcam...' );
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia( {
+                audio: false,
+                video: { facingMode: 'environment' }, // Adjust facing mode as needed
+            } );
+            setWebcamStream( stream );
+            if ( webcamElement.current ) {
+                webcamElement.current.srcObject = stream;
+                webcamElement.current.onloadedmetadata = () =>
+                {
+                    setVideoOrigWidth( webcamElement.current!.videoWidth );
+                    setVideoOrigHeight( webcamElement.current!.videoHeight );
+                };
+            }
+        } catch ( error ) {
+            console.error( 'Error accessing webcam:', error );
+            setWebcamEnabled( false );
+        }
+    };
+
+    // Stop the webcam stream and cleanup
+    const stopCamera = () =>
+    {
+        if ( webcamElement.current ) {
+            webcamElement.current.pause();
+        }
+        setWebcamEnabled( false );
+    };
+
+    // Start the webcam stream and initialize
+    const startCamera = async () =>
+    {
+        setSessionRunning( true );
+        try {
+            await setupWebcam();
+            if ( webcamElement.current ) {
+                await webcamElement.current.play();
+            }
+            setWebcamInitialized( true );
+        } catch ( error ) {
+            console.error( 'Error starting webcam:', error );
+            setSessionRunning( false );
+            setWebcamEnabled( false );
+        }
+        setSessionRunning( false );
+        setWebcamEnabled( true );
+    };
+
+    // Run live video and inference
+    const runLiveVideo = async () =>
+    {
+        console.log( 'Running live video...' );
+        await startCamera();
+        console.log( 'Webcam enabled is ?:', webcamEnabled );
+        while ( webcamEnabled ) {
+            console.log( 'Capturing frame...' );
+            const ctx = capture();
+            await runModel( ctx );
+            await new Promise<void>( ( resolve ) => requestAnimationFrame( () => resolve() ) );
+        }
+    };
+
+    // Run model inference on captured frame
+    const runModel = async ( ctx: CanvasRenderingContext2D ) =>
+    {
+        console.log( 'Running model...' );
+        setSessionRunning( true );
+        const data = preprocess( ctx );
+        const [ outputTensor, inferenceTime ] = await runModelUtils.runModel( session!, data );
+        postprocess( outputTensor, inferenceTime );
+        setInferenceTime( inferenceTime );
+        setSessionRunning( false );
+    };
+
+    // Clear canvas and inference time
+    const clearCanvas = () =>
+    {
+        setInferenceTime( 0 );
+        const canvas = document.getElementById( 'screenshot' ) as HTMLCanvasElement;
+        const ctx = canvas.getContext( '2d' );
+        if ( ctx ) {
+            ctx.clearRect( 0, 0, ctx.canvas.width, ctx.canvas.height );
+        }
+    };
+
+    // Capture image from video stream
+    const capture = (): CanvasRenderingContext2D =>
+    {
+        const canvas = document.getElementById( 'screenshot' ) as HTMLCanvasElement;
+        const context = canvas.getContext( '2d' )!;
+        context.drawImage(
+            webcamElement.current!,
+            0,
+            0,
+            webcamElement.current!.width,
+            webcamElement.current!.height
+        );
+        return context;
+    };
+
+    return (
+        <div>
+            <div>
+                <label>Select Backend:</label>
+                <select
+                    value={ sessionBackend }
+                    onChange={ ( e ) => setSessionBackend( e.target.value ) }
+                    disabled={ modelLoading || modelInitializing || sessionRunning }
+                >
+                    { backendSelectList.map( ( backend ) => (
+                        <option key={ backend.value } value={ backend.value }>
+                            { backend.text }
+                        </option>
+                    ) ) }
+                </select>
+            </div>
+            { modelLoadingError && (
+                <div className="error-message">
+                    Error: Current backend is not supported on your machine. Try selecting a different backend.
+                </div>
+            ) }
+            <div ref={ webcamContainer }>
+                <video ref={ webcamElement } autoPlay />
+                <canvas id="screenshot" />
+            </div>
+            <div>
+                <button onClick={ webcamController }>
+                    { webcamEnabled ? 'Stop Camera' : 'Start Camera' }
+                </button>
+            </div>
+        </div>
+    );
+};
+
+export default WebcamModelUI;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { InferenceSession, Tensor } from 'onnxruntime-web';
+import { runModelUtils } from '../../utils';
+
+interface WebcamModelUIProps
+{
+    modelFilepath: string;
+    warmupModel: ( session: InferenceSession ) => Promise<void>;
+    preprocess: ( ctx: CanvasRenderingContext2D ) => Tensor;
+    postprocess: ( t: Tensor, inferenceTime: number ) => void;
+}
+
+const WebcamModelUI: React.FC<WebcamModelUIProps> = ( {
+    modelFilepath,
+    warmupModel,
+    preprocess,
+    postprocess,
+} ) =>
+{
+    const webcamElement = useRef<HTMLVideoElement>( null );
+    const webcamContainer = useRef<HTMLDivElement>( null );
+    const [ videoOrigWidth, setVideoOrigWidth ] = useState( 0 );
+    const [ videoOrigHeight, setVideoOrigHeight ] = useState( 0 );
+    const [ inferenceTime, setInferenceTime ] = useState( 0 );
+    const [ session, setSession ] = useState<InferenceSession | null>( null );
+    const [ gpuSession, setGpuSession ] = useState<InferenceSession | undefined>( undefined );
+    const [ cpuSession, setCpuSession ] = useState<InferenceSession | undefined>( undefined );
+    const [ modelLoading, setModelLoading ] = useState( true );
+    const [ modelInitializing, setModelInitializing ] = useState( true );
+    const [ sessionRunning, setSessionRunning ] = useState( false );
+    const [ modelLoadingError, setModelLoadingError ] = useState( false );
+    const [ webcamEnabled, setWebcamEnabled ] = useState( false ); // Default to false
+    const [ webcamInitialized, setWebcamInitialized ] = useState( false );
+    const [ webcamStream, setWebcamStream ] = useState<MediaStream | null>( null );
+    const [ sessionBackend, setSessionBackend ] = useState( 'wasm' ); // Default to 'wasm'
+    const [ modelFile, setModelFile ] = useState<ArrayBuffer | null>( null ); // Track model file buffer
+
+    const backendSelectList = [
+        { text: 'GPU-WebGL', value: 'webgl' },
+        { text: 'CPU-WebAssembly', value: 'wasm' },
+    ];
+
+    // Initialize the session based on selected backend
+    const initSession = useCallback( async ( modelFileBuffer: ArrayBuffer ) =>
+    {
+        console.log( 'Initializing session...' );
+        setSessionRunning( false );
+        setModelLoadingError( false );
+        setModelLoading( true );
+        setModelInitializing( true );
+        let gpuSessionInstance: InferenceSession | undefined;
+        let cpuSessionInstance: InferenceSession | undefined;
+        try {
+            if ( sessionBackend === 'webgl' ) {
+                gpuSessionInstance = await runModelUtils.createModelGpu( modelFileBuffer );
+                setGpuSession( gpuSessionInstance );
+                setSession( gpuSessionInstance );
+            } else if ( sessionBackend === 'wasm' ) {
+                cpuSessionInstance = await runModelUtils.createModelCpu( modelFileBuffer );
+                setCpuSession( cpuSessionInstance );
+                setSession( cpuSessionInstance );
+            }
+            await warmupModel( cpuSessionInstance || gpuSessionInstance! );
+        } catch ( e ) {
+            console.error( 'Error initializing session:', e );
+            setModelLoadingError( true );
+        }
+        setModelLoading( false );
+        setModelInitializing( false );
+    }, [ sessionBackend, warmupModel ] );
+
+    // Fetch the model file and initialize the session on mount
+    useEffect( () =>
+    {
+        const fetchModelFile = async () =>
+        {
+            try {
+                const response = await fetch( modelFilepath );
+                const modelFileBuffer = await response.arrayBuffer();
+                setModelFile( modelFileBuffer );
+                await initSession( modelFileBuffer );
+            } catch ( error ) {
+                console.error( 'Error fetching or initializing model:', error );
+                setModelLoadingError( true );
+            }
+        };
+
+        fetchModelFile();
+    }, [ modelFilepath, initSession ] );
+
+    // Handle starting and stopping the camera
+    const webcamController = () =>
+    {
+        console.log( 'Webcam controller clicked' );
+        if ( webcamEnabled ) {
+            stopCamera();
+        } else {
+            runLiveVideo();
+        }
+    };
+
+    // Setup webcam and start streaming
+    const setupWebcam = async () =>
+    {
+        console.log( 'Setting up webcam...' );
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia( {
+                audio: false,
+                video: { facingMode: 'environment' }, // Adjust facing mode as needed
+            } );
+            setWebcamStream( stream );
+            if ( webcamElement.current ) {
+                webcamElement.current.srcObject = stream;
+                webcamElement.current.onloadedmetadata = () =>
+                {
+                    setVideoOrigWidth( webcamElement.current!.videoWidth );
+                    setVideoOrigHeight( webcamElement.current!.videoHeight );
+                };
+            }
+        } catch ( error ) {
+            console.error( 'Error accessing webcam:', error );
+            setWebcamEnabled( false );
+        }
+    };
+
+    // Stop the webcam stream and cleanup
+    const stopCamera = () =>
+    {
+        if ( webcamElement.current ) {
+            webcamElement.current.pause();
+        }
+        setWebcamEnabled( false );
+    };
+
+    // Start the webcam stream and initialize
+    const startCamera = async () =>
+    {
+        setSessionRunning( true );
+        try {
+            await setupWebcam();
+            if ( webcamElement.current ) {
+                await webcamElement.current.play();
+            }
+            setWebcamInitialized( true );
+            console.log( 'Webcam initialized setstate done' );
+        } catch ( error ) {
+            console.error( 'Error starting webcam:', error );
+            setSessionRunning( false );
+            setWebcamEnabled( false );
+        }
+        setSessionRunning( false );
+        setWebcamEnabled( true ); // Update webcamEnabled to true after successful setup
+    };
+
+    // Run live video and inference
+    const runLiveVideo = async () =>
+    {
+        console.log( 'Running live video...' );
+        await startCamera();
+        console.log( 'Webcam enabled ????:', webcamEnabled );
+
+        console.log( 'Capturing frame...' );
+        const ctx = capture();
+        await runModel( ctx );
+        await new Promise<void>( ( resolve ) => requestAnimationFrame( () => resolve() ) );
+
+
+
+    };
+
+    // Run model inference on captured frame
+    const runModel = async ( ctx: CanvasRenderingContext2D ) =>
+    {
+        console.log( 'Running model...' );
+        setSessionRunning( true );
+        const data = preprocess( ctx );
+        const [ outputTensor, inferenceTime ] = await runModelUtils.runModel( session!, data );
+        console.log( 'Inference time:', inferenceTime );
+        console.log( 'Output tensor:', outputTensor );
+        postprocess( outputTensor, inferenceTime );
+        setInferenceTime( inferenceTime );
+        setSessionRunning( false );
+    };
+
+    // Clear canvas and inference time
+    const clearCanvas = () =>
+    {
+        setInferenceTime( 0 );
+        const canvas = document.getElementById( 'screenshot' ) as HTMLCanvasElement;
+        const ctx = canvas.getContext( '2d' );
+        if ( ctx ) {
+            ctx.clearRect( 0, 0, ctx.canvas.width, ctx.canvas.height );
+        }
+    };
+
+    // Capture image from video stream
+    const capture = (): CanvasRenderingContext2D =>
+    {
+        const canvas = document.getElementById( 'screenshot' ) as HTMLCanvasElement;
+        const context = canvas.getContext( '2d' )!;
+        context.drawImage(
+            webcamElement.current!,
+            0,
+            0,
+            webcamElement.current!.width,
+            webcamElement.current!.height
+        );
+        return context;
+    };
+
+    return (
+        <div>
+            <div>
+                <label>Select Backend:</label>
+                <select
+                    value={ sessionBackend }
+                    onChange={ ( e ) => setSessionBackend( e.target.value ) }
+                    disabled={ modelLoading || modelInitializing || sessionRunning }
+                >
+                    { backendSelectList.map( ( backend ) => (
+                        <option key={ backend.value } value={ backend.value }>
+                            { backend.text }
+                        </option>
+                    ) ) }
+                </select>
+            </div>
+            { modelLoadingError && (
+                <div className="error-message">
+                    Error: Current backend is not supported on your machine. Try selecting a different backend.
+                </div>
+            ) }
+            <div ref={ webcamContainer }>
+                <video ref={ webcamElement } autoPlay />
+                <canvas id="screenshot" />
+            </div>
+            <div>
+                <button onClick={ webcamController }>
+                    { webcamEnabled ? 'Stop Camera' : 'Start Camera' }
+                </button>
+            </div>
+        </div>
+    );
+};
+
+export default WebcamModelUI;

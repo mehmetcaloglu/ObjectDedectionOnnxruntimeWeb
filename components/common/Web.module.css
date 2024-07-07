@@ -1,0 +1,39 @@
+.webcam-container {
+  border-radius: 15px;
+  border-width: 10px;
+  border-color: red;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.24);
+  margin: 0 auto;
+  width: 416px;
+  height: 416px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+/* Add a specific class for additional styles */
+.webcam-container-additional {
+  position: absolute;
+  border: 1px solid red;
+  font-size: 24px;
+}
+
+.webcam-container .webcam-container-additional:first-child {
+  background-color: white;
+  color: black;
+  opacity: 0.8;
+  font-size: 12px;
+  padding: 3px;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+
+  .webcam-panel {
+    padding: 40px 20px;
+    margin-top: 30px;
+    background-color: white;
+    position: relative;
+  }
